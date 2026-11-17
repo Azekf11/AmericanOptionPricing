@@ -1,0 +1,6 @@
+numpy>=1.24
+matplotlib>=3.7
+pytest>=7.0
+
+# seulement pour retelecharger les donnees
+# yfinance>=0.2
