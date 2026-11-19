@@ -4,7 +4,7 @@ from math import exp, sqrt
 import numpy as np
 
 from src.aleatoire.normales import METHODES, Normales
-from src.modele.black_scholes import prix_bs
+from src.modele.black_scholes import prix_bs, prix_bs_vect
 from src.modele.payoff import payoff
 from src.modele.trajectoires import simuler_trajectoires
 
@@ -17,13 +17,35 @@ def base(x, degre):
     return np.vander(x, degre + 1, increasing=True)
 
 
+# polynomes de laguerre ponderes (article LS) : 1, e^(-x/2) L_0, ..., e^(-x/2) L_(d-1)
+def base_laguerre(x, degre):
+    e = np.exp(-x / 2)
+    colonnes = [np.ones_like(x)]
+    L_avant, L = np.zeros_like(x), np.ones_like(x)
+    for n in range(degre):
+        colonnes.append(e * L)
+        L_avant, L = L, ((2 * n + 1 - x) * L - n * L_avant) / (n + 1)
+    return np.column_stack(colonnes)
+
+
+BASES = {"monomes": base, "laguerre": base_laguerre}
+
+
 # exercice si h > 0 et h > continuation
-def decision(h, continuation):
-    return (h > 0) & (h > continuation)
+# plancher : on refuse l'exercice si h <= prix europeen de l'echeance restante
+def decision(h, continuation, S_k, reste, plancher):
+    exercer = (h > 0) & (h > continuation)
+
+    if plancher is not None and exercer.any():
+        idx = np.flatnonzero(exercer)
+        eu = plancher(S_k[idx], reste)
+        exercer[idx[h[idx] <= eu]] = False
+
+    return exercer
 
 
 # recurrence retrograde (S : trajectoires, colonne 0 = S0)
-def recurrence(S, K, r, dt, type_option, degre=3, itm=True):
+def recurrence(S, K, r, dt, type_option, degre=3, itm=True, plancher=None, fbase=base):
     n_traj, n_col = S.shape
     N = n_col - 1
 
@@ -43,21 +65,83 @@ def recurrence(S, K, r, dt, type_option, degre=3, itm=True):
 
         # regression sur x = S/K
         x = S[:, k] / K
-        beta, *_ = np.linalg.lstsq(base(x[sel], degre), Y[sel], rcond=None)
+        beta, *_ = np.linalg.lstsq(fbase(x[sel], degre), Y[sel], rcond=None)
         coefs[k] = beta
-        continuation = base(x, degre) @ beta
+        continuation = fbase(x, degre) @ beta
 
         # exercice
-        ex = decision(h, continuation)
+        ex = decision(h, continuation, S[:, k], (N - k) * dt, plancher)
         flux = np.where(ex, h, flux)
         tau = np.where(ex, k, tau)
 
     return flux * np.exp(-r * tau * dt), tau, coefs
 
 
+# regle deja estimee appliquee a de nouvelles trajectoires (hors echantillon)
+def appliquer(S, K, r, dt, type_option, coefs, degre, plancher=None, fbase=base):
+    n_traj, n_col = S.shape
+    N = n_col - 1
+
+    flux = payoff(type_option, S[:, N], K)
+    tau = np.full(n_traj, N)
+    actif = np.ones(n_traj, dtype=bool)
+
+    for k in range(1, N):
+        if k not in coefs:
+            continue
+        h = payoff(type_option, S[:, k], K)
+        continuation = fbase(S[:, k] / K, degre) @ coefs[k]
+        ex = actif & decision(h, continuation, S[:, k], (N - k) * dt, plancher)
+        flux = np.where(ex, h, flux)
+        tau = np.where(ex, k, tau)
+        actif &= ~ex
+
+    return flux * np.exp(-r * tau * dt), tau
+
+
+# frontiere d'exercice de la regle estimee : (t, S*) a chaque date
+def frontiere(coefs, K, dt, type_option, degre, grille=None, fbase=base):
+    if grille is None:
+        grille = np.linspace(0.3 * K, 2.0 * K, 4001)
+
+    h = payoff(type_option, grille, K)
+    points = []
+
+    for k in sorted(coefs):
+        continuation = fbase(grille / K, degre) @ coefs[k]
+        ex = (h > 0) & (h > continuation)
+        if ex.any():
+            critique = grille[ex].max() if type_option == "put" else grille[ex].min()
+            points.append((k * dt, critique))
+
+    return np.array(points)
+
+
+# en antithetique, une observation = moyenne d'une paire
+def par_paires(x, antithetique):
+    if antithetique:
+        moitie = x.size // 2
+        return 0.5 * (x[:moitie] + x[moitie:])
+    return x
+
+
 # moyenne et erreur type
-def stats(flux):
-    return float(flux.mean()), float(flux.std(ddof=1) / sqrt(flux.size))
+def stats(flux, antithetique=False):
+    x = par_paires(flux, antithetique)
+    return float(x.mean()), float(x.std(ddof=1) / sqrt(x.size))
+
+
+# variable de controle : Y = A - b (E - prix exact), b = cov(A, E) / var(E)
+def controle(flux, flux_eu, prix_eu, antithetique=False):
+    A = par_paires(flux, antithetique)
+    E = par_paires(flux_eu, antithetique)
+
+    cov = np.cov(A, E, ddof=1)
+    b = cov[0, 1] / cov[1, 1]
+    rho = cov[0, 1] / sqrt(cov[0, 0] * cov[1, 1])
+
+    Y = A - b * (E - prix_eu)
+    return float(Y.mean()), float(Y.std(ddof=1) / sqrt(Y.size)), float(b), float(rho)
 
 
 # pricer d'option americaine (fonction demandee par le sujet)
@@ -65,7 +149,10 @@ def prix_option_americaine(type_option, S0, K, T, r, sigma, q=0.0,
                            n_simulations=100_000, n_dates=50,
                            degre=3, itm_seulement=True,
                            methode_normale="box-muller", graine=42,
-                           generateur_uniforme="park-miller"):
+                           generateur_uniforme="park-miller",
+                           antithetique=False, hors_echantillon=False,
+                           controle_europeen=False, plancher_europeen=False,
+                           base_regression="monomes"):
 
     # verification des entrees
     if type_option not in ("call", "put"):
@@ -80,6 +167,10 @@ def prix_option_americaine(type_option, S0, K, T, r, sigma, q=0.0,
         raise ValueError("methode_normale inconnue")
     if generateur_uniforme not in ("park-miller", "wichmann-hill"):
         raise ValueError("generateur_uniforme inconnu")
+    if base_regression not in BASES:
+        raise ValueError("base_regression : 'monomes' ou 'laguerre'")
+    if antithetique and n_simulations % 2:
+        n_simulations += 1
 
     debut = time.perf_counter()
 
@@ -88,25 +179,45 @@ def prix_option_americaine(type_option, S0, K, T, r, sigma, q=0.0,
     dt = T / N
     normales = Normales(methode_normale, generateur_uniforme, graine)
 
+    # plancher europeen (option)
+    def europeen(S_noeuds, reste):
+        return prix_bs_vect(type_option, S_noeuds, K, reste, r, sigma, q)
+
+    plancher = europeen if plancher_europeen else None
+
     # simulation + recurrence
-    S = simuler_trajectoires(S0, T, r, sigma, q, n_simulations, N, normales)
-    flux, tau, coefs = recurrence(S, K, r, dt, type_option, degre, itm_seulement)
+    S = simuler_trajectoires(S0, T, r, sigma, q, n_simulations, N, normales, antithetique)
+    fbase = BASES[base_regression]
+    flux, tau, coefs = recurrence(S, K, r, dt, type_option, degre, itm_seulement, plancher, fbase)
+
+    # hors echantillon : nouveau jeu de trajectoires, meme regle
+    if hors_echantillon:
+        S = simuler_trajectoires(S0, T, r, sigma, q, n_simulations, N, normales, antithetique)
+        flux, tau = appliquer(S, K, r, dt, type_option, coefs, degre, plancher, fbase)
 
     # europeenne sur les memes trajectoires
     flux_eu = payoff(type_option, S[:, -1], K) * exp(-r * T)
     prix_eu = prix_bs(type_option, S0, K, T, r, sigma, q)
+    prix_vc, erreur_vc, b, rho = controle(flux, flux_eu, prix_eu, antithetique)
 
     details = {
         "n_dates": N,
         "dt": dt,
         "coefs": coefs,
         "part_exercee": float(np.mean(tau < N)),
-        "prix_eu_mc": stats(flux_eu)[0],
+        "prix_eu_mc": stats(flux_eu, antithetique)[0],
         "prix_eu_bs": prix_eu,
+        "prime": prix_vc - prix_eu,
+        "erreur_prime": erreur_vc,
+        "b_controle": b,
+        "correlation": rho,
     }
 
     # prix final
-    prix, erreur_type = stats(flux)
+    if controle_europeen:
+        prix, erreur_type = prix_vc, erreur_vc
+    else:
+        prix, erreur_type = stats(flux, antithetique)
 
     # exercice immediat en t = 0
     h0 = float(payoff(type_option, np.array([S0]), K)[0])

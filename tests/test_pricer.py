@@ -3,7 +3,7 @@ import pytest
 
 from src.modele.arbre_crr import prix_crr
 from src.modele.black_scholes import prix_bs
-from src.pricer.longstaff_schwartz import prix_option_americaine, recurrence
+from src.pricer.longstaff_schwartz import base, base_laguerre, prix_option_americaine, recurrence
 
 
 # cas de reference de longstaff-schwartz
@@ -20,6 +20,10 @@ HUIT = np.array([
     [1.00, 0.92, 0.84, 1.01],
     [1.00, 0.88, 1.22, 1.34],
 ])
+
+# put proche de totalenergies (q > r)
+TTE = dict(S0=78.2, K=86.0, T=1.0, r=0.0244, sigma=0.234, q=0.0445)
+
 
 # exemple du cours
 
@@ -76,3 +80,48 @@ def test_entrees_invalides(modif):
     p.update(modif)
     with pytest.raises(ValueError):
         prix_option_americaine(**p)
+
+
+# variantes : plancher europeen, variable de controle, base de laguerre
+
+def test_plancher_sans_effet_cas_ls():
+    a = prix_option_americaine("put", **LS)
+    b = prix_option_americaine("put", plancher_europeen=True, **LS)
+    assert a["prix"] == b["prix"]
+
+
+def test_plancher_corrige_prime_negative():
+    brut = prix_option_americaine("put", **TTE)
+    corr = prix_option_americaine("put", plancher_europeen=True, **TTE)
+    assert brut["details"]["prime"] < -3 * brut["details"]["erreur_prime"]
+    ref = prix_crr("put", exercice="bermudien", n_dates_exercice=50, **TTE) - prix_bs("put", **TTE)
+    assert abs(corr["details"]["prime"] - ref) < 0.01
+    assert corr["details"]["part_exercee"] < brut["details"]["part_exercee"] / 5
+
+
+def test_controle_reduit_erreur():
+    p = dict(S0=40, K=40, T=1, r=0.06, sigma=0.2, q=0.04)
+    a = prix_option_americaine("call", plancher_europeen=True, **p)
+    b = prix_option_americaine("call", plancher_europeen=True, controle_europeen=True, **p)
+    assert b["erreur_type"] < a["erreur_type"] / 5
+
+
+def test_call_sans_dividende_redevient_europeen():
+    p = dict(S0=40, K=40, T=1, r=0.06, sigma=0.2, q=0.0)
+    res = prix_option_americaine("call", plancher_europeen=True, controle_europeen=True, **p)
+    assert res["prix"] == pytest.approx(prix_bs("call", **p), abs=1e-10)
+    assert res["details"]["part_exercee"] == 0.0
+
+
+def test_laguerre_formules():
+    x = np.array([0.5, 1.0, 1.3])
+    e = np.exp(-x / 2)
+    attendu = np.column_stack([np.ones_like(x), e, e * (1 - x), e * (1 - 2 * x + x**2 / 2)])
+    assert np.allclose(base_laguerre(x, 3), attendu)
+    assert base_laguerre(x, 3).shape == base(x, 3).shape
+
+
+def test_laguerre_prix():
+    berm = prix_crr("put", **LS, exercice="bermudien", n_dates_exercice=50)
+    res = prix_option_americaine("put", **LS, base_regression="laguerre")
+    assert abs(res["prix"] - berm) < 3 * res["erreur_type"]
