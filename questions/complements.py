@@ -6,7 +6,37 @@ from math import sqrt
 import numpy as np
 
 from questions.outils import CAS_LS, crr_bermudien, ecrire_csv
+from src.calibration.totalenergies import calibrer
+from src.modele.black_scholes import prix_bs
 from src.pricer.longstaff_schwartz import prix_option_americaine
+
+
+# plancher europeen sur 10 graines
+def plancher(cal):
+    cas = {
+        "put LS": ("put", dict(CAS_LS)),
+        "put TTE K=86": ("put", dict(S0=cal["S0"], K=86.0, T=1.0, r=cal["r"],
+                                     sigma=cal["sigma"], q=cal["q"])),
+        "call q=4%": ("call", dict(S0=40.0, K=40.0, T=1.0, r=0.06, sigma=0.2, q=0.04)),
+    }
+    lignes = []
+
+    for nom, (type_option, p) in cas.items():
+        prime_ref = crr_bermudien(type_option, **p) - prix_bs(type_option, **p)
+        for mode, options in (("brut", {}), ("plancher", {"plancher_europeen": True})):
+            primes, parts = [], []
+            for g in range(1, 11):
+                r = prix_option_americaine(type_option, **p, graine=g, **options)
+                primes.append(r["details"]["prime"])
+                parts.append(r["details"]["part_exercee"])
+            m = float(np.mean(primes))
+            s = float(np.std(primes, ddof=1) / sqrt(len(primes)))
+            lignes.append({"cas": nom, "estimateur": mode, "prime_moyenne": m, "se_moyenne": s,
+                           "prime_crr": prime_ref, "ecart_en_se": (m - prime_ref) / s,
+                           "part_exercee": float(np.mean(parts))})
+            print(nom, mode, round(m, 4), round((m - prime_ref) / s, 1))
+
+    ecrire_csv("comp_plancher", lignes)
 
 
 # validation croisee : meme option, deux codes ecrits separement (generateurs differents), 20 graines chacun
@@ -40,6 +70,8 @@ def validation_croisee():
 def main():
     print("Complements")
     validation_croisee()
+    cal = calibrer()
+    plancher(cal)
 
 
 if __name__ == "__main__":
