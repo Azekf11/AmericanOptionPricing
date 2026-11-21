@@ -1,18 +1,137 @@
 # verifications en plus des trois questions
 # lancer depuis la racine :  python -m questions.complements
 
-from math import exp, sqrt
+import time
+from math import erf, exp, sqrt
 
 import numpy as np
 
 from questions.outils import CAS_LS, crr_bermudien, ecrire_csv
-from src.aleatoire.normales import Normales
+from src.aleatoire.lcg import A_PM, M_PM, LCGBlocs
+from src.aleatoire.normales import METHODES, Normales
 from src.calibration.totalenergies import calibrer
 from src.modele.arbre_crr import prix_crr
 from src.modele.black_scholes import prix_bs, prix_bs_vect
 from src.modele.payoff import payoff
 from src.modele.trajectoires import simuler_trajectoires
 from src.pricer.longstaff_schwartz import frontiere, prix_option_americaine, recurrence
+
+
+GENERATEURS = ("park-miller", "wichmann-hill")
+
+
+def phi(x):
+    return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+
+
+# qualite des generateurs : 2 generateurs x 3 methodes
+def generateurs(ref):
+    n = 1_000_000
+    queue_theorique = n * 2 * (1 - phi(3.5))
+    lignes = []
+
+    for gen in GENERATEURS:
+        for methode in METHODES:
+            asym, kurt, queues, temps = [], [], [], []
+            for g in range(1, 21):
+                debut = time.perf_counter()
+                z = Normales(methode, gen, g).tirer(n)
+                temps.append(time.perf_counter() - debut)
+                asym.append(np.mean(z**3) / sqrt(6 / n))
+                kurt.append((np.mean(z**4) - 3) / sqrt(24 / n))
+                queues.append(np.sum(np.abs(z) > 3.5))
+
+            prix = [prix_option_americaine("put", **CAS_LS, methode_normale=methode,
+                                           generateur_uniforme=gen, graine=g)["prix"]
+                    for g in range(1, 11)]
+
+            lignes.append({
+                "generateur": gen,
+                "methode": methode,
+                "asymetrie_z": float(np.mean(asym)),
+                "kurtosis_z": float(np.mean(kurt)),
+                "queues_obs": float(np.mean(queues)),
+                "queues_theo": queue_theorique,
+                "temps_1M": float(np.mean(temps)),
+                "prix_moyen": float(np.mean(prix)),
+                "se_moyenne": float(np.std(prix, ddof=1) / sqrt(len(prix))),
+                "ecart_berm": float(np.mean(prix)) - ref,
+            })
+            print(gen, methode, round(lignes[-1]["prix_moyen"], 4))
+
+    ecrire_csv("comp_generateurs", lignes)
+
+
+# piege des graines d'un lcg (x0 = graine) contre des blocs disjoints
+def graines():
+    n = 1_000_000
+    lignes = []
+
+    for semis in ("x0 = graine", "blocs disjoints"):
+        u, z = [], []
+        for g in (1, 2):
+            for liste, sortie in ((u, "u"), (z, "z")):
+                gen = Normales("box-muller", "park-miller", g)
+                if semis == "x0 = graine":
+                    gen.u.lcg = [LCGBlocs(A_PM, M_PM, g)]
+                liste.append(gen.u.tirer(n) if sortie == "u" else gen.tirer(n))
+
+        lignes.append({"semis": semis,
+                       "corr_u": float(np.corrcoef(u[0], u[1])[0, 1]),
+                       "corr_abs_z": float(np.corrcoef(np.abs(z[0]), np.abs(z[1]))[0, 1])})
+        print(lignes[-1])
+
+    ecrire_csv("comp_graines", lignes)
+
+
+# l'erreur type annoncee est-elle la vraie dispersion ? (60 graines)
+def validation_erreur_type():
+    n_sim = 10_000
+    p = CAS_LS
+    res = {"europeen": ([], []), "in-sample": ([], []), "hors echantillon": ([], [])}
+
+    for g in range(1, 61):
+        a = prix_option_americaine("put", **p, n_simulations=n_sim, graine=g)
+        res["in-sample"][0].append(a["prix"])
+        res["in-sample"][1].append(a["erreur_type"])
+
+        S = simuler_trajectoires(p["S0"], p["T"], p["r"], p["sigma"], p["q"], n_sim, 50,
+                                 Normales("box-muller", "park-miller", g))
+        e = payoff("put", S[:, -1], p["K"]) * exp(-p["r"] * p["T"])
+        res["europeen"][0].append(e.mean())
+        res["europeen"][1].append(e.std(ddof=1) / sqrt(n_sim))
+
+        h = prix_option_americaine("put", **p, n_simulations=n_sim, graine=g, hors_echantillon=True)
+        res["hors echantillon"][0].append(h["prix"])
+        res["hors echantillon"][1].append(h["erreur_type"])
+
+    lignes = []
+    for nom, (prix, se) in res.items():
+        disp = float(np.std(prix, ddof=1))
+        lignes.append({"estimateur": nom, "runs": len(prix), "N": n_sim,
+                       "prix_moyen": float(np.mean(prix)), "dispersion": disp,
+                       "erreur_type_annoncee": float(np.mean(se)),
+                       "rapport": disp / float(np.mean(se)),
+                       "incertitude_rapport": 1 / sqrt(2 * (len(prix) - 1))})
+        print(nom, round(lignes[-1]["rapport"], 3))
+
+    ecrire_csv("comp_erreur_type", lignes)
+
+
+# biais in-sample / hors echantillon
+def in_sample_hors_echantillon(ref):
+    lignes = []
+    for N in (10_000, 100_000):
+        for mode, options in (("in-sample", {}), ("hors echantillon", {"hors_echantillon": True})):
+            prix = [prix_option_americaine("put", **CAS_LS, n_simulations=N, graine=g, **options)["prix"]
+                    for g in range(1, 21)]
+            m = float(np.mean(prix))
+            s = float(np.std(prix, ddof=1) / sqrt(len(prix)))
+            lignes.append({"N": N, "estimateur": mode, "prix_moyen": m, "se_moyenne": s,
+                           "ecart_berm": m - ref, "ecart_en_se": (m - ref) / s})
+            print(N, mode, round(m, 4))
+
+    ecrire_csv("comp_hors_echantillon", lignes)
 
 
 # plancher europeen sur 10 graines
@@ -141,9 +260,14 @@ def main():
     print("Complements")
     validation_croisee()
     conditionnement()
+    ref = crr_bermudien("put", **CAS_LS)
     cal = calibrer()
     diagnostic(cal)
+    graines()
+    validation_erreur_type()
+    in_sample_hors_echantillon(ref)
     plancher(cal)
+    generateurs(ref)
 
 
 if __name__ == "__main__":
