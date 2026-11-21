@@ -1,0 +1,16 @@
+grandeur,valeur
+S* crr t=0.1,33.514050311173555
+S* lsm t=0.1,33.794
+S* crr t=0.5,34.42550034661735
+S* lsm t=0.5,34.474000000000004
+S* crr t=0.9,36.64978207767527
+S* lsm t=0.9,35.97
+ecart max frontieres t<=0.9,0.6797820776752701
+interets sur K (1 an),2.4734618618143855
+put europeen S=30,8.096557579030897
+TTE put prix brut,12.728438933306137
+TTE put part exercee,0.48716
+TTE part des exercices apres t=0.6,0.9924665407668938
+TTE part des exercices sous l'europeen,0.9602184087363494
+TTE manque moyen (europeen - payoff),0.16225684500335327
+TTE part des mauvais exercices apres t=0.6,0.9999786224293471
